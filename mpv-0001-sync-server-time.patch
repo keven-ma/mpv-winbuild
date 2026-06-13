@@ -1,4 +1,4 @@
-From 583bac22c97b4f6e5c30a602d5fb8e4f4375e5ef Mon Sep 17 00:00:00 2001
+From ef4d6b34ee993ac115e4cda4181faf26258650be Mon Sep 17 00:00:00 2001
 From: keven-ma <60804914+keven-ma@users.noreply.github.com>
 Date: Sat, 13 Jun 2026 14:27:21 +0800
 Subject: [PATCH] sync server time for mpv
@@ -15,11 +15,11 @@ Subject: [PATCH] sync server time for mpv
  player/core.h        |   3 +
  player/loadfile.c    |   8 ++
  player/main.c        |   1 +
- player/playloop.c    |  53 ++++++++++
+ player/playloop.c    |  15 +++
  player/server_sync.c | 236 +++++++++++++++++++++++++++++++++++++++++++
  player/server_sync.h | 135 +++++++++++++++++++++++++
  player/video.c       |  15 +++
- 15 files changed, 693 insertions(+), 1 deletion(-)
+ 15 files changed, 655 insertions(+), 1 deletion(-)
  create mode 100644 player/server_sync.c
  create mode 100644 player/server_sync.h
 
@@ -442,7 +442,7 @@ index 6891c9d5a1..13322cb523 100644
      mpctx->global = talloc_zero(mpctx, struct mpv_global);
  
 diff --git a/player/playloop.c b/player/playloop.c
-index d899fba123..5f9423c298 100644
+index d899fba123..5bc5c9f909 100644
 --- a/player/playloop.c
 +++ b/player/playloop.c
 @@ -26,6 +26,7 @@
@@ -474,53 +474,6 @@ index d899fba123..5f9423c298 100644
      m_config_notify_change_opt_ptr(mpctx->mconfig, &opts->pause);
  }
  
-@@ -1257,8 +1272,46 @@ static void handle_clipboard_updates(struct MPContext *mpctx)
-         mp_notify_property(mpctx, "clipboard");
- }
- 
-+static void handle_server_pause(struct MPContext *mpctx) {
-+    if (!mpctx->vo_chain || !mpctx->vo_chain->vo)
-+        return;
-+    if (mpctx->vo_chain->vo->opts->video_sync != VS_TIMECODE)
-+        return;
-+
-+    struct mp_ntp_clock *sc = &mpctx->ntp_clock;
-+    bool ntp_paused = mp_ntp_clock_is_paused(sc);
-+    bool user_paused   = mpctx->opts->pause;
-+
-+    if (ntp_paused == user_paused)
-+        return;
-+
-+    if (ntp_paused) {
-+        // Server requested pause: seek precisely to the target timecode first,
-+        // then pause.  set_pause_state(true) sets opts->pause = true so the
-+        // next call won't re-enter this branch.
-+        double target_tc = mp_ntp_clock_get_target_timecode(sc);
-+        if (target_tc != MP_NOPTS_VALUE) {
-+            queue_seek(mpctx, MPSEEK_ABSOLUTE, target_tc, MPSEEK_EXACT, 0);
-+            
-+            // Clean up PID and local speed residuals because this preempts write_video
-+            mp_ntp_clock_reset_pid(sc);
-+            if (mpctx->speed_factor_v != 1.0 || mpctx->speed_factor_a != 1.0) {
-+                mpctx->speed_factor_v = 1.0;
-+                mpctx->speed_factor_a = 1.0;
-+                update_playback_speed(mpctx);
-+            }
-+        }
-+        set_pause_state(mpctx, true);
-+    } else {
-+        // Server resumed: lift the pause we set.
-+        set_pause_state(mpctx, false);
-+    }
-+}
-+
- void run_playloop(struct MPContext *mpctx)
- {
-+    handle_server_pause(mpctx);
-+
-     if (encode_lavc_didfail(mpctx->encode_lavc_ctx)) {
-         mpctx->stop_play = PT_ERROR;
-         return;
 diff --git a/player/server_sync.c b/player/server_sync.c
 new file mode 100644
 index 0000000000..42947a9dbe
