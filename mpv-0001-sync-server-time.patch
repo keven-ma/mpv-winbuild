@@ -1,0 +1,871 @@
+From bda39828f2b235748ed60505e5666faa4f9260c5 Mon Sep 17 00:00:00 2001
+From: keven-ma <60804914+keven-ma@users.noreply.github.com>
+Date: Sat, 13 Jun 2026 14:27:21 +0800
+Subject: [PATCH] sync server time for mpv
+
+---
+ include/mpv/client.h |  86 ++++++++++++++++
+ meson.build          |   1 +
+ player/client.c      |  35 +++++++
+ player/command.c     |  99 +++++++++++++++++-
+ player/core.h        |   3 +
+ player/loadfile.c    |   8 ++
+ player/main.c        |   1 +
+ player/playloop.c    |  53 ++++++++++
+ player/server_sync.c | 236 +++++++++++++++++++++++++++++++++++++++++++
+ player/server_sync.h | 135 +++++++++++++++++++++++++
+ player/video.c       |  15 +++
+ 11 files changed, 671 insertions(+), 1 deletion(-)
+ create mode 100644 player/server_sync.c
+ create mode 100644 player/server_sync.h
+
+diff --git a/include/mpv/client.h b/include/mpv/client.h
+index f72a0e0a46..d0b17ccc91 100644
+--- a/include/mpv/client.h
++++ b/include/mpv/client.h
+@@ -622,6 +622,92 @@ MPV_EXPORT int64_t mpv_get_time_ns(mpv_handle *ctx);
+  */
+ MPV_EXPORT int64_t mpv_get_time_us(mpv_handle *ctx);
+ 
++/**
++ * Server-synchronized playback (timecode sync) API.
++ *
++ * These functions allow synchronizing mpv playback to a remote server's
++ * timeline. They are designed to be called from any thread with minimal
++ * overhead (lock-free atomic operations internally).
++ *
++ * Usage flow:
++ * 1. Set video-sync=timecode option before or during playback
++ * 2. Call mpv_server_clock_sync() to establish NTP-like time correlation
++ * 3. Call mpv_server_timecode_set() to provide server playback state
++ * 4. mpv will automatically align video/audio to the server timecode
++ */
++
++/**
++ * Set the NTP synchronization point. This correlates the local monotonic
++ * clock with the server's time. Call this periodically (e.g. every few
++ * seconds) to maintain accurate time correlation.
++ *
++ * @param server_time The current server time in seconds (e.g. Unix epoch).
++ *                    The absolute value doesn't matter as long as it's
++ *                    consistent with values passed to mpv_server_timecode_set().
++ *
++ * Safe to be called from any thread. Lock-free.
++ */
++MPV_EXPORT void mpv_server_clock_sync(mpv_handle *ctx, double server_time);
++
++/**
++ * Set the server's current playback state. This tells mpv what media
++ * timecode the server is at (or was at) at a given server time.
++ *
++ * @param server_time The server time when this timecode was sampled.
++ *                    Must be in the same time base as mpv_server_clock_sync().
++ * @param timecode    The media timecode (playback position) at server_time,
++ *                    in seconds.
++ * @param paused      Whether the server is currently paused.
++ *
++ * Safe to be called from any thread. Lock-free.
++ */
++MPV_EXPORT void mpv_server_timecode_set(mpv_handle *ctx,
++                                         double server_time,
++                                         double timecode,
++                                         int paused);
++
++/**
++ * Get the current computed server time based on the last sync point and
++ * local clock elapsed time.
++ *
++ * @return The current server time in seconds, or a negative value if
++ *         no sync point has been set yet.
++ *
++ * Safe to be called from any thread. Lock-free.
++ */
++MPV_EXPORT double mpv_server_clock_get(mpv_handle *ctx);
++
++/**
++ * Get the last committed video frame position paired with the server time at
++ * which it was captured.  This triple is guaranteed to be perfectly consistent:
++ * at server time *out_server_time, the client's video was at *out_video_pts
++ * and the pause state was *out_is_paused.
++ *
++ * The value may be up to one video frame behind the actual current position,
++ * but the three output values always correspond to the same instant — they are
++ * written atomically inside the playback thread via a seqlock.
++ *
++ * Typical use on a master node: call mpv_server_clock_sync() periodically,
++ * then poll this function and broadcast the result to slave players so they
++ * can call mpv_server_timecode_set() to synchronize.
++ *
++ * @param out_server_time  Set to the server time (seconds) of the snapshot.
++ *                         Must not be NULL.
++ * @param out_video_pts    Set to the video position (seconds) at that time.
++ *                         Must not be NULL.
++ * @param out_is_paused    Set to non-zero if the player was paused at snapshot
++ *                         time.  Must not be NULL.
++ * @return 0 on success; -1 if no snapshot is available yet (call
++ *         mpv_server_clock_sync() first to establish the time base).
++ *
++ * Safe to be called from any thread. Lock-free.
++ */
++MPV_EXPORT int mpv_get_video_sync_point(mpv_handle *ctx,
++                                         double *out_server_time,
++                                         double *out_video_pts,
++                                         int    *out_is_paused);
++
++
+ /**
+  * Data format for options and properties. The API functions to get/set
+  * properties and options support multiple formats, and this enum describes
+diff --git a/meson.build b/meson.build
+index 1cd2570f0d..b923439e5b 100644
+--- a/meson.build
++++ b/meson.build
+@@ -165,6 +165,7 @@ sources = files(
+     ## Player
+     'player/audio.c',
+     'player/client.c',
++    'player/server_sync.c',
+     'player/command.c',
+     'player/configfiles.c',
+     'player/external_files.c',
+diff --git a/player/client.c b/player/client.c
+index 61c998dbb8..a8fd064ef6 100644
+--- a/player/client.c
++++ b/player/client.c
+@@ -46,6 +46,7 @@
+ #include "command.h"
+ #include "core.h"
+ #include "client.h"
++#include "server_sync.h"
+ 
+ /*
+  * Locking hierarchy:
+@@ -2140,6 +2141,40 @@ int64_t mpv_get_time_us(mpv_handle *ctx)
+     return mp_time_ns() / 1000;
+ }
+ 
++void mpv_ntp_clock_sync(mpv_handle *ctx, double ntp_time)
++{
++    mp_ntp_clock_set_time(&ctx->mpctx->ntp_clock, ntp_time);
++    mp_wakeup_core(ctx->mpctx);
++}
++
++void mpv_ntp_timecode_set(mpv_handle *ctx, double ntp_time,
++                              double timecode, int paused)
++{
++    mp_ntp_clock_set_timecode(&ctx->mpctx->ntp_clock,
++                                 ntp_time, timecode, paused);
++    mp_wakeup_core(ctx->mpctx);
++}
++
++double mpv_ntp_clock_get(mpv_handle *ctx)
++{
++    return mp_ntp_clock_get_ntp_time(&ctx->mpctx->ntp_clock);
++}
++
++int mpv_get_video_sync_point(mpv_handle *ctx,
++                              double *out_ntp_time,
++                              double *out_video_pts,
++                              int    *out_is_paused)
++{
++    bool paused;
++    bool ok = mp_ntp_clock_get_video_pts(&ctx->mpctx->ntp_clock,
++                                             out_ntp_time,
++                                             out_video_pts,
++                                             &paused);
++    if (ok)
++        *out_is_paused = paused ? 1 : 0;
++    return ok ? 0 : -1;
++}
++
+ #include "video/out/libmpv.h"
+ 
+ static void do_kill(void *ptr)
+diff --git a/player/command.c b/player/command.c
+index 0dea4bfc94..20ab28e680 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -4601,6 +4601,68 @@ static int mp_property_clipboard(void *ctx, struct m_property *prop,
+ #define M_PROPERTY_DEPRECATED_ALIAS(name, real_property) \
+     {(name), mp_property_deprecated_alias, .priv = (real_property)}
+ 
++
++// Returns a NODE_MAP with all sync statistics in a single atomic snapshot:
++//   "is-correcting"   (flag)  – whether speed correction is currently active
++//   "frames-total"    (int64) – total frames evaluated
++//   "frames-diff-17"  (int64) – frames with |diff| < 17 ms  (~1 frame @60fps)
++//   "frames-diff-35"  (int64) – frames with |diff| < 35 ms  (~2 frames @60fps)
++//   "frames-diff-50"  (int64) – frames with |diff| < 50 ms
++//   "frames-diff-68"  (int64) – frames with |diff| < 68 ms  (~4 frames @60fps)
++static int mp_property_ntp_sync_stats(void *ctx, struct m_property *prop,
++                                          int action, void *arg)
++{
++    struct MPContext *mpctx = ctx;
++    if (action == M_PROPERTY_GET_TYPE) {
++        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
++        return M_PROPERTY_OK;
++    }
++    if (action != M_PROPERTY_GET)
++        return M_PROPERTY_NOT_IMPLEMENTED;
++
++    struct mp_ntp_clock *sc = &mpctx->ntp_clock;
++    struct mpv_node node = {0};
++    node_init(&node, MPV_FORMAT_NODE_MAP, NULL);
++    node_map_add_flag (&node, "is-correcting",  atomic_load(&sc->stat_is_correcting));
++    node_map_add_int64(&node, "frames-total",   atomic_load(&sc->stat_frames_total));
++    node_map_add_int64(&node, "frames-diff-17", atomic_load(&sc->stat_frames_diff_17));
++    node_map_add_int64(&node, "frames-diff-35", atomic_load(&sc->stat_frames_diff_35));
++    node_map_add_int64(&node, "frames-diff-50", atomic_load(&sc->stat_frames_diff_50));
++    node_map_add_int64(&node, "frames-diff-68", atomic_load(&sc->stat_frames_diff_68));
++    *(struct mpv_node *)arg = node;
++    return M_PROPERTY_OK;
++}
++
++// Returns a NODE_MAP with keys "ntp-time", "video-pts", and "is-paused".
++// All three values come from the same atomic seqlock snapshot — they are
++// guaranteed to be internally consistent:
++//   at ntp-time X, video was at video-pts Y with pause state Z.
++// This is the primary API for master/slave synchronization via Node.js IPC.
++static int mp_property_ntp_sync_pos(void *ctx, struct m_property *prop,
++                                         int action, void *arg)
++{
++    struct MPContext *mpctx = ctx;
++    if (action == M_PROPERTY_GET_TYPE) {
++        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
++        return M_PROPERTY_OK;
++    }
++    if (action != M_PROPERTY_GET)
++        return M_PROPERTY_NOT_IMPLEMENTED;
++
++    double ntp_time, video_pts;
++    bool is_paused;
++    if (!mp_ntp_clock_get_video_pts(&mpctx->ntp_clock, &ntp_time, &video_pts, &is_paused))
++        return M_PROPERTY_UNAVAILABLE;
++
++    struct mpv_node node = {0};
++    node_init(&node, MPV_FORMAT_NODE_MAP, NULL);
++    node_map_add_double(&node, "ntp-time",    ntp_time * 1000.0);
++    node_map_add_double(&node, "video-pts",   video_pts);
++    node_map_add_flag(&node,   "is-paused",   is_paused);
++    *(struct mpv_node *)arg = node;
++    return M_PROPERTY_OK;
++}
++
+ // Base list of properties. This does not include option-mapped properties.
+ static const struct m_property mp_properties_base[] = {
+     // General
+@@ -4641,6 +4703,8 @@ static const struct m_property mp_properties_base[] = {
+     {"remaining-ab-loops", mp_property_remaining_ab_loops},
+     {"chapter", mp_property_chapter},
+     {"edition", mp_property_edition},
++    {"ntp-sync-stats", mp_property_ntp_sync_stats},
++    {"ntp-sync-pos", mp_property_ntp_sync_pos},
+     {"current-edition", mp_property_current_edition},
+     {"chapters", mp_property_chapters},
+     {"editions", mp_property_editions},
+@@ -4857,7 +4921,8 @@ static const char *const *const mp_event_property_change[] = {
+       "decoder-frame-drop-count", "frame-drop-count", "video-frame-info",
+       "vf-metadata", "af-metadata", "sub-start", "sub-end", "secondary-sub-start",
+       "secondary-sub-end", "sub-lines", "secondary-sub-lines", "video-out-params",
+-      "video-dec-params", "video-params", "deinterlace-active", "video-target-params"),
++      "video-dec-params", "video-params",
++      "deinterlace-active", "video-target-params", "ntp-sync-pos"),
+     E(MP_EVENT_DURATION_UPDATE, "duration"),
+     E(MPV_EVENT_VIDEO_RECONFIG, "video-out-params", "video-params",
+       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
+@@ -7447,12 +7512,44 @@ static void cmd_notify_property(void *p)
+  * Lua with mp.command_native().
+  */
+ 
++static void cmd_ntp_clock_sync(void *p) {
++    struct mp_cmd_ctx *cmd = p;
++    struct MPContext *mpctx = cmd->mpctx;
++    double ntp_time = cmd->args[0].v.d;
++    int64_t svr_time = cmd->args[1].v.i64;
++    int64_t now_ms = mp_sys_time_us() / 1000;
++    int64_t diff = now_ms - svr_time;
++    MP_VERBOSE(mpctx, "[cmd_ntp_clock_sync]: ntp-time:%.3f, svr-time:%lld diff:%lldms\n", ntp_time, (long long)svr_time, diff);
++    mp_ntp_clock_set_time(&mpctx->ntp_clock, (ntp_time + diff) / 1000.0);
++}
++
++static void cmd_ntp_timecode(void *p) {
++    struct mp_cmd_ctx *cmd = p;
++    struct MPContext *mpctx = cmd->mpctx;
++    mp_ntp_clock_set_timecode(&mpctx->ntp_clock,
++        cmd->args[0].v.d / 1000.0, cmd->args[1].v.d, cmd->args[2].v.b);
++}
++
+ // This does not specify the real destination of the command parameter values,
+ // it just provides a dummy for the OPT_ macros. The real destination is an
+ // array item  in mp_cmd.args[], using the index of the option definition.
+ #define OPT_BASE_STRUCT struct mp_cmd_arg
+ 
+ const struct mp_cmd_def mp_cmds[] = {
++    { "ntp-clock-sync", cmd_ntp_clock_sync,
++        {
++            {"ntp-time", OPT_DOUBLE(v.d)},
++            {"svr-time", OPT_INT64(v.i64)},
++        },
++    },
++    { "ntp-timecode", cmd_ntp_timecode,
++        {
++            {"ntp-time", OPT_DOUBLE(v.d)},
++            {"timecode", OPT_DOUBLE(v.d)},
++            {"paused", OPT_BOOL(v.b)},
++        },
++    },
++
+     { "ignore", cmd_ignore, .is_ignore = true, .is_noisy = true, },
+ 
+     { "seek", cmd_seek,
+diff --git a/player/core.h b/player/core.h
+index f17a8a9a32..32b49e0a83 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -33,6 +33,7 @@
+ #include "video/out/vo.h"
+ #include "osdep/als.h"
+ #include "demux/stheader.h"
++#include "server_sync.h"
+ 
+ // definitions used internally by the core player code
+ 
+@@ -453,6 +454,8 @@ typedef struct MPContext {
+ 
+     struct mp_ipc_ctx *ipc_ctx;
+ 
++    struct mp_ntp_clock ntp_clock;
++
+     int64_t builtin_script_ids[9];
+ 
+     mp_mutex abort_lock;
+diff --git a/player/loadfile.c b/player/loadfile.c
+index 0b3e70d550..82675521a3 100644
+--- a/player/loadfile.c
++++ b/player/loadfile.c
+@@ -60,6 +60,8 @@
+ 
+ #include "core.h"
+ #include "command.h"
++#include "server_sync.h"
++
+ 
+ // Called from the demuxer thread if a new packet is available, or other changes.
+ static void wakeup_demux(void *pctx)
+@@ -1766,6 +1768,12 @@ static void play_current_file(struct MPContext *mpctx)
+ 
+     reset_playback_state(mpctx);
+ 
++    // Wipe all ntp-clock state (NTP, timecode, statistics, PID) so that
++    // stale data from the previous file cannot affect the new playback session.
++    // NTP re-sync will happen on the next server message; the clock is simply
++    // "not valid" until then, which is the correct initial condition.
++    mp_ntp_clock_reset(&mpctx->ntp_clock);
++
+ #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+     if (mpctx->playlist->num_entries > 3)
+         goto terminate_playback;
+diff --git a/player/main.c b/player/main.c
+index 6891c9d5a1..13322cb523 100644
+--- a/player/main.c
++++ b/player/main.c
+@@ -286,6 +286,7 @@ struct MPContext *mp_create(void)
+     };
+ 
+     mp_mutex_init(&mpctx->abort_lock);
++    mp_ntp_clock_init(&mpctx->ntp_clock);
+ 
+     mpctx->global = talloc_zero(mpctx, struct mpv_global);
+ 
+diff --git a/player/playloop.c b/player/playloop.c
+index d899fba123..5f9423c298 100644
+--- a/player/playloop.c
++++ b/player/playloop.c
+@@ -26,6 +26,7 @@
+ #include "core.h"
+ #include "mpv_talloc.h"
+ #include "screenshot.h"
++#include "server_sync.h"
+ 
+ #include "audio/out/ao.h"
+ #include "common/common.h"
+@@ -194,6 +195,20 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
+ 
+     update_core_idle_state(mpctx);
+ 
++    // Keep the video-sync-point snapshot up-to-date whenever pause state
++    // changes.  During normal playback write_video() does this per-frame, but
++    // when the player is paused no new frames arrive, so we must push the
++    // updated is_paused flag explicitly.
++    if (atomic_load_explicit(&mpctx->ntp_clock.clock_valid,
++                             memory_order_relaxed) &&
++        mpctx->video_pts != MP_NOPTS_VALUE)
++    {
++        double sv_time = mp_ntp_clock_get_ntp_time(&mpctx->ntp_clock);
++        mp_ntp_clock_commit_video_pts(&mpctx->ntp_clock,
++                                         sv_time, mpctx->video_pts,
++                                         mpctx->paused);
++    }
++
+     m_config_notify_change_opt_ptr(mpctx->mconfig, &opts->pause);
+ }
+ 
+@@ -1257,8 +1272,46 @@ static void handle_clipboard_updates(struct MPContext *mpctx)
+         mp_notify_property(mpctx, "clipboard");
+ }
+ 
++static void handle_server_pause(struct MPContext *mpctx) {
++    if (!mpctx->vo_chain || !mpctx->vo_chain->vo)
++        return;
++    if (mpctx->vo_chain->vo->opts->video_sync != VS_TIMECODE)
++        return;
++
++    struct mp_ntp_clock *sc = &mpctx->ntp_clock;
++    bool ntp_paused = mp_ntp_clock_is_paused(sc);
++    bool user_paused   = mpctx->opts->pause;
++
++    if (ntp_paused == user_paused)
++        return;
++
++    if (ntp_paused) {
++        // Server requested pause: seek precisely to the target timecode first,
++        // then pause.  set_pause_state(true) sets opts->pause = true so the
++        // next call won't re-enter this branch.
++        double target_tc = mp_ntp_clock_get_target_timecode(sc);
++        if (target_tc != MP_NOPTS_VALUE) {
++            queue_seek(mpctx, MPSEEK_ABSOLUTE, target_tc, MPSEEK_EXACT, 0);
++            
++            // Clean up PID and local speed residuals because this preempts write_video
++            mp_ntp_clock_reset_pid(sc);
++            if (mpctx->speed_factor_v != 1.0 || mpctx->speed_factor_a != 1.0) {
++                mpctx->speed_factor_v = 1.0;
++                mpctx->speed_factor_a = 1.0;
++                update_playback_speed(mpctx);
++            }
++        }
++        set_pause_state(mpctx, true);
++    } else {
++        // Server resumed: lift the pause we set.
++        set_pause_state(mpctx, false);
++    }
++}
++
+ void run_playloop(struct MPContext *mpctx)
+ {
++    handle_server_pause(mpctx);
++
+     if (encode_lavc_didfail(mpctx->encode_lavc_ctx)) {
+         mpctx->stop_play = PT_ERROR;
+         return;
+diff --git a/player/server_sync.c b/player/server_sync.c
+new file mode 100644
+index 0000000000..42947a9dbe
+--- /dev/null
++++ b/player/server_sync.c
+@@ -0,0 +1,236 @@
++#include "server_sync.h"
++#include <math.h>
++
++void mp_ntp_clock_init(struct mp_ntp_clock *sc) {
++    atomic_init(&sc->clock_valid, false);
++    atomic_init(&sc->local_time_ns, 0);
++    atomic_init(&sc->ntp_time_us, 0);
++
++    atomic_init(&sc->tc_gen, 0);
++    atomic_init(&sc->timecode_valid, false);
++    atomic_init(&sc->tc_ntp_time_us, 0);
++    atomic_init(&sc->tc_timecode_us, 0);
++    atomic_init(&sc->tc_paused, false);
++
++    atomic_init(&sc->stat_is_correcting, false);
++    atomic_init(&sc->stat_frames_total, 0);
++    atomic_init(&sc->stat_frames_diff_17, 0);
++    atomic_init(&sc->stat_frames_diff_35, 0);
++    atomic_init(&sc->stat_frames_diff_50, 0);
++    atomic_init(&sc->stat_frames_diff_68, 0);
++
++    atomic_init(&sc->vpts_seq, 0);
++    atomic_init(&sc->vpts_server_us, 0);
++    atomic_init(&sc->vpts_pts_us, 0);
++    atomic_init(&sc->vpts_paused, 0);
++
++    sc->pid_integral      = 0.0;
++    sc->pid_last_diff     = 0.0;
++    sc->pid_last_speed    = 1.0;
++    sc->pid_is_correcting = false;
++}
++
++void mp_ntp_clock_set_time(struct mp_ntp_clock *sc, double ntp_time) {
++    atomic_store(&sc->local_time_ns, mp_time_ns());
++    atomic_store(&sc->ntp_time_us, (int64_t)(ntp_time * 1000000.0));
++    atomic_store(&sc->clock_valid, true);
++}
++
++double mp_ntp_clock_get_ntp_time(struct mp_ntp_clock *sc) {
++    if (!atomic_load(&sc->clock_valid))
++        return MP_NOPTS_VALUE;
++    int64_t local_elapsed = mp_time_ns() - atomic_load(&sc->local_time_ns);
++    double server_base = atomic_load(&sc->ntp_time_us) / 1000000.0;
++    return server_base + local_elapsed / 1000000000.0;
++}
++
++// Seqlock-protected write.  The reader in mp_ntp_clock_get_target_timecode
++// spins if it sees an odd generation, and retries if it sees a generation
++// change between its two reads.  This guarantees the reader always sees a
++// consistent (ntp_time, timecode, paused) triple.
++void mp_ntp_clock_set_timecode(struct mp_ntp_clock *sc, double ntp_time,
++                                   double timecode, bool paused)
++{
++    // ── begin write: bump generation to odd ──
++    uint32_t gen = atomic_load_explicit(&sc->tc_gen, memory_order_relaxed);
++    uint32_t next_odd = (gen | 1u);
++    atomic_store_explicit(&sc->tc_gen, next_odd, memory_order_relaxed);
++    atomic_thread_fence(memory_order_release);
++
++    atomic_store_explicit(&sc->tc_ntp_time_us,
++                          (int64_t)(ntp_time * 1000000.0),
++                          memory_order_relaxed);
++    atomic_store_explicit(&sc->tc_timecode_us,
++                          (int64_t)(timecode   * 1000000.0),
++                          memory_order_relaxed);
++    atomic_store_explicit(&sc->tc_paused, paused, memory_order_relaxed);
++
++    // ── end write: bump generation to even ──
++    atomic_thread_fence(memory_order_release);
++    atomic_store_explicit(&sc->tc_gen, next_odd + 1u, memory_order_relaxed);
++
++    // Mark valid only after payload is complete.
++    atomic_store(&sc->timecode_valid, true);
++}
++
++// Seqlock-protected read.  Retries until it catches a stable even generation.
++double mp_ntp_clock_get_target_timecode(struct mp_ntp_clock *sc) {
++    if (!atomic_load(&sc->clock_valid))
++        return MP_NOPTS_VALUE;
++
++    int64_t tc_us, st_us;
++    bool paused;
++
++    for (;;) {
++        uint32_t g1 = atomic_load_explicit(&sc->tc_gen, memory_order_acquire);
++        if (g1 & 1u)
++            continue;  // write in progress, spin
++
++        if (!atomic_load_explicit(&sc->timecode_valid, memory_order_relaxed))
++            return MP_NOPTS_VALUE;
++
++        tc_us  = atomic_load_explicit(&sc->tc_timecode_us,    memory_order_relaxed);
++        st_us  = atomic_load_explicit(&sc->tc_ntp_time_us, memory_order_relaxed);
++        paused = atomic_load_explicit(&sc->tc_paused,         memory_order_relaxed);
++
++        atomic_thread_fence(memory_order_acquire);
++        uint32_t g2 = atomic_load_explicit(&sc->tc_gen, memory_order_relaxed);
++        if (g1 == g2)
++            break;  // consistent snapshot obtained
++    }
++
++    double tc = tc_us / 1000000.0;
++    if (paused)
++        return tc;  // frozen at reported position
++
++    double tc_st   = st_us / 1000000.0;
++    double now_st  = mp_ntp_clock_get_ntp_time(sc);
++    return tc + (now_st - tc_st);
++}
++
++bool mp_ntp_clock_is_paused(struct mp_ntp_clock *sc) {
++    if (!atomic_load(&sc->timecode_valid))
++        return false;
++    return atomic_load(&sc->tc_paused);
++}
++
++void mp_ntp_clock_add_stat(struct mp_ntp_clock *sc, double abs_diff, bool is_correcting) {
++    atomic_store(&sc->stat_is_correcting, is_correcting);
++    atomic_fetch_add(&sc->stat_frames_total, 1);
++    if (abs_diff < 0.017) atomic_fetch_add(&sc->stat_frames_diff_17, 1);
++    if (abs_diff < 0.035) atomic_fetch_add(&sc->stat_frames_diff_35, 1);
++    if (abs_diff < 0.050) atomic_fetch_add(&sc->stat_frames_diff_50, 1);
++    if (abs_diff < 0.068) atomic_fetch_add(&sc->stat_frames_diff_68, 1);
++}
++
++// Reset PID controller state.  Call after any seek or restart so that stale
++// integral / derivative history does not pollute the new playback segment.
++void mp_ntp_clock_reset_pid(struct mp_ntp_clock *sc) {
++    sc->pid_integral      = 0.0;
++    sc->pid_last_diff     = 0.0;
++    sc->pid_last_speed    = 1.0;
++    sc->pid_is_correcting = false;
++}
++
++// Full reset: wipes all runtime state so the next playback session starts clean.
++// Clears NTP validity, timecode validity, statistics, vpts snapshot, and PID.
++// The struct itself stays allocated — call init() only once at process startup.
++void mp_ntp_clock_reset(struct mp_ntp_clock *sc) {
++    // NTP sync
++    atomic_store(&sc->clock_valid, false);
++    atomic_store(&sc->local_time_ns, 0);
++    atomic_store(&sc->ntp_time_us, 0);
++
++    // Timecode seqlock payload — bump tc_gen to an even value so readers see
++    // a stable (but invalid) generation, then clear timecode_valid.
++    atomic_store_explicit(&sc->tc_gen, 0, memory_order_relaxed);
++    atomic_store(&sc->timecode_valid, false);
++    atomic_store(&sc->tc_ntp_time_us, 0);
++    atomic_store(&sc->tc_timecode_us, 0);
++    atomic_store(&sc->tc_paused, false);
++
++    // Statistics
++    atomic_store(&sc->stat_is_correcting, false);
++    atomic_store(&sc->stat_frames_total, 0);
++    atomic_store(&sc->stat_frames_diff_17, 0);
++    atomic_store(&sc->stat_frames_diff_35, 0);
++    atomic_store(&sc->stat_frames_diff_50, 0);
++    atomic_store(&sc->stat_frames_diff_68, 0);
++
++    // vpts seqlock snapshot — reset to "never committed" (seq = 0)
++    atomic_store_explicit(&sc->vpts_seq, 0, memory_order_relaxed);
++    atomic_store_explicit(&sc->vpts_server_us, 0, memory_order_relaxed);
++    atomic_store_explicit(&sc->vpts_pts_us, 0, memory_order_relaxed);
++    atomic_store_explicit(&sc->vpts_paused, 0, memory_order_relaxed);
++
++    // PID controller
++    mp_ntp_clock_reset_pid(sc);
++}
++
++// Seqlock writer: called from the playback thread (single writer).
++// Writes an atomic (ntp_time, video_pts, is_paused) snapshot.
++void mp_ntp_clock_commit_video_pts(struct mp_ntp_clock *sc,
++                                       double ntp_time, double video_pts,
++                                       bool is_paused)
++{
++    if (!atomic_load(&sc->clock_valid))
++        return;
++
++    // Step 1: mark write-in-progress by setting seq to odd.
++    uint64_t seq = atomic_load_explicit(&sc->vpts_seq, memory_order_relaxed);
++    atomic_store_explicit(&sc->vpts_seq, seq | 1, memory_order_relaxed);
++
++    // Step 2: release fence ensures the "odd" marker is visible before
++    // the payload writes below.
++    atomic_thread_fence(memory_order_release);
++
++    atomic_store_explicit(&sc->vpts_server_us,
++                          (int64_t)(ntp_time * 1000000.0),
++                          memory_order_relaxed);
++    atomic_store_explicit(&sc->vpts_pts_us,
++                          (int64_t)(video_pts   * 1000000.0),
++                          memory_order_relaxed);
++    atomic_store_explicit(&sc->vpts_paused,
++                          (int32_t)is_paused,
++                          memory_order_relaxed);
++
++    // Step 3: release fence then advance seq to next even value, signalling
++    // readers that the payload is complete.
++    atomic_thread_fence(memory_order_release);
++    atomic_store_explicit(&sc->vpts_seq, (seq | 1) + 1, memory_order_relaxed);
++}
++
++// Seqlock reader: safe to call from any thread.
++bool mp_ntp_clock_get_video_pts(struct mp_ntp_clock *sc,
++                                    double *out_ntp_time,
++                                    double *out_video_pts,
++                                    bool   *out_is_paused)
++{
++    for (;;) {
++        // Acquire-load ensures we see the latest seq before reading payload.
++        uint64_t seq1 = atomic_load_explicit(&sc->vpts_seq, memory_order_acquire);
++
++        if (seq1 == 0)
++            return false;  // never committed
++
++        if (seq1 & 1)
++            continue;  // write in progress — spin
++
++        int64_t st      = atomic_load_explicit(&sc->vpts_server_us, memory_order_relaxed);
++        int64_t pts     = atomic_load_explicit(&sc->vpts_pts_us,    memory_order_relaxed);
++        int32_t paused  = atomic_load_explicit(&sc->vpts_paused,    memory_order_relaxed);
++
++        // Acquire fence then re-read seq to detect concurrent write.
++        atomic_thread_fence(memory_order_acquire);
++        uint64_t seq2 = atomic_load_explicit(&sc->vpts_seq, memory_order_relaxed);
++
++        if (seq1 != seq2)
++            continue;  // writer updated during our read — retry
++
++        *out_ntp_time = (double)st  / 1000000.0;
++        *out_video_pts   = (double)pts / 1000000.0;
++        *out_is_paused   = (bool)paused;
++        return true;
++    }
++}
++
+diff --git a/player/server_sync.h b/player/server_sync.h
+new file mode 100644
+index 0000000000..77f657f628
+--- /dev/null
++++ b/player/server_sync.h
+@@ -0,0 +1,135 @@
++#ifndef MP_SERVER_SYNC_H
++#define MP_SERVER_SYNC_H
++
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include "osdep/timer.h"
++#include "common/common.h"
++
++// PID 控制器 + 平滑滤波器
++// 2.1 核心思路
++// 用一个增量式 PID 控制器代替分段线性查表：
++
++
++// ┌──────────────────────────┐
++//                     │  P项: 比例 (即时纠正)    │
++//  diff (误差) ──────▶│  I项: 积分 (消除稳态误差)│──▶ speed_shift ──▶ 低通滤波器 ──▶ 最终速度
++//                     │  D项: 微分 (预测趋势)    │
++//                     └──────────────────────────┘
++// P 项：按误差大小比例输出速度偏移，处理即时误差
++// I 项：累积误差，消除服务器时钟频率漂移导致的稳态误差
++// D 项（可选）：检测误差变化趋势，防止过冲
++// 低通滤波器：对输出速度做平滑，防止速度频繁切换造成音频颤音
++// 2.2 具体参数（针对你的场景）
++// 你的场景特点：
++
++// 通常只有视频，无音频
++// 服务器时钟有漂移（飘逸），50ms 以内不干预
++// 需要快速追上大误差
++// 对应的 PID 参数策略：
++
++// Kp（比例系数）：大误差时主导，小误差时次要
++// Ki（积分系数）：非常小，只用于消除服务器时钟漂移
++// Kd：可选，避免过冲时使用
++// 低通滤波器 α：平滑速度输出，防止颤音
++
++// 指标            现有方案（分段线性 P）    改进方案（PID + 低通）
++// 小误差(<50ms)      不干预 ✓                  不干预 ✓
++// 50-100ms 追赶      线性变速，有振荡风险       低 Kp PID，平滑收敛
++// 100-200ms 追赶     斜率突变，速度阶跃         中 Kp PID，无阶跃
++// 200ms+ 追赶        较快，但超调后会振荡       大 Kp + D 防超调
++// 服务器时钟漂移      无法消除 ✗                I 项自动补偿 ✓
++// 音频颤音           高风险（速度帧帧跳变）✗    低通滤波器消除 ✓
++
++struct mp_ntp_clock {
++    // NTP synchronization state
++    atomic_bool clock_valid;
++    atomic_int_least64_t local_time_ns;
++    atomic_int_least64_t ntp_time_us;
++
++    // Server playback state — protected by a seqlock (tc_gen).
++    // Writer increments tc_gen to odd before writing, then to even after.
++    // Reader retries if tc_gen is odd or changes between two reads.
++    atomic_uint_least32_t tc_gen;       // seqlock generation (odd = writing)
++    atomic_bool timecode_valid;
++
++    // Payload written under the seqlock
++    atomic_int_least64_t tc_ntp_time_us;
++    atomic_int_least64_t tc_timecode_us;
++    atomic_bool tc_paused;
++
++    // Statistics
++    atomic_bool stat_is_correcting;
++    atomic_uint_least64_t stat_frames_total;
++    atomic_uint_least64_t stat_frames_diff_17;
++    atomic_uint_least64_t stat_frames_diff_35;
++    atomic_uint_least64_t stat_frames_diff_50;
++    atomic_uint_least64_t stat_frames_diff_68;
++
++    // Committed video PTS sync point (seqlock: odd = writing, even = done, 0 = never set)
++    // Guarantees that (vpts_server_us, vpts_pts_us, vpts_paused) are always a consistent
++    // snapshot: "at server time X, video was at position Y and pause state was Z"
++    atomic_uint_least64_t vpts_seq;        // seqlock generation counter
++    atomic_int_least64_t  vpts_server_us;  // server time when snapshot was taken (microseconds)
++    atomic_int_least64_t  vpts_pts_us;     // video_pts at that server time (microseconds)
++    atomic_int_least32_t  vpts_paused;     // paused state at snapshot time (0 or 1)
++
++    // ── PID controller state ────────────────────────────────────────────────
++    // These fields are ONLY accessed from the playback thread (write_video /
++    // update_avsync_before_frame), so plain double/bool — no atomics needed.
++    double pid_integral;      // I-term accumulator
++    double pid_last_diff;     // previous error (for D-term)
++    double pid_last_speed;    // last output speed (for low-pass filter)
++    bool   pid_is_correcting; // explicit correction state (avoids float compare)
++};
++
++// Initializes the server clock to an invalid/zero state
++void mp_ntp_clock_init(struct mp_ntp_clock *sc);
++
++// Set the NTP synchronization point
++void mp_ntp_clock_set_time(struct mp_ntp_clock *sc, double ntp_time);
++
++// Get the current computed server time based on local elapsed time
++double mp_ntp_clock_get_ntp_time(struct mp_ntp_clock *sc);
++
++// Set the server's playback timecode and paused state (seqlock-protected write)
++void mp_ntp_clock_set_timecode(struct mp_ntp_clock *sc, double ntp_time, double timecode, bool paused);
++
++// Get the expected timecode of the media exactly right now
++double mp_ntp_clock_get_target_timecode(struct mp_ntp_clock *sc);
++
++// Check if the server is paused
++bool mp_ntp_clock_is_paused(struct mp_ntp_clock *sc);
++
++// Record sync offset statistics
++void mp_ntp_clock_add_stat(struct mp_ntp_clock *sc, double abs_diff, bool is_correcting);
++
++// Reset PID state after a seek or playback restart.
++// Must be called from the playback thread.
++void mp_ntp_clock_reset_pid(struct mp_ntp_clock *sc);
++
++// Full reset of all runtime state: NTP validity, timecode validity, statistics,
++// PID controller, and vpts snapshot.  Call this when a new file starts playing
++// so that stale clock data from the previous file cannot affect the new one.
++// Safe to call from the playback thread.
++void mp_ntp_clock_reset(struct mp_ntp_clock *sc);
++
++// Commit an atomic (ntp_time, video_pts, is_paused) snapshot.
++// Call this whenever video_pts or pause state changes (from the playback thread).
++// Lock-free using a seqlock — safe to call from the playback thread.
++void mp_ntp_clock_commit_video_pts(struct mp_ntp_clock *sc,
++                                       double ntp_time, double video_pts,
++                                       bool is_paused);
++
++// Read the last committed snapshot.
++// Returns true if a valid snapshot exists, false if none has been committed yet.
++// The returned triple is guaranteed to be internally consistent:
++// at ntp_time X, video was exactly at video_pts Y with pause state Z.
++// Lock-free using a seqlock — safe to call from any thread.
++bool mp_ntp_clock_get_video_pts(struct mp_ntp_clock *sc,
++                                    double *out_ntp_time,
++                                    double *out_video_pts,
++                                    bool   *out_is_paused);
++
++#endif
+diff --git a/player/video.c b/player/video.c
+index 820bbfbf6c..14e7402a98 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -1249,6 +1249,21 @@ void write_video(struct MPContext *mpctx)
+     mpctx->last_frame_duration =
+         mpctx->next_frames[0]->pkt_duration / mpctx->video_speed;
+ 
++    // Commit an atomic (ntp_time, video_pts, is_paused) snapshot for external query.
++    // We capture server time at exactly the same moment video_pts is updated,
++    // guaranteeing the triple is perfectly consistent.
++    if (atomic_load_explicit(&mpctx->ntp_clock.clock_valid,
++                             memory_order_relaxed))
++    {
++        double sv_time = mp_ntp_clock_get_ntp_time(&mpctx->ntp_clock);
++        // mpctx->playback_pts (get_current_time) lags by 1 frame here because
++        // handle_playback_time runs after write_video. Since we are in write_video,
++        // video_pts is exactly what playback_pts will become.
++        mp_ntp_clock_commit_video_pts(&mpctx->ntp_clock,
++                                         sv_time, mpctx->video_pts,
++                                         mpctx->paused);
++    }
++
+     shift_frames(mpctx);
+ 
+     schedule_frame(mpctx, frame);
+-- 
+2.47.0.windows.1
+

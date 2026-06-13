@@ -74,7 +74,7 @@ jobs:
             const commit = await github.rest.repos.getCommit({
               owner: 'mpv-player',
               repo: 'mpv',
-              ref: `master`
+              ref: `7d245fd`
             })
             core.setOutput('sha', String(commit.data.sha))
             
@@ -382,6 +382,13 @@ jobs:
         shell: bash
         run: |
           chmod +x build.sh
+          
+          # 复制自定义的 mpv 源码补丁到底层编译工具链的 packages 文件夹中
+          cp ../mpv-*.patch mpv-winbuild-cmake/packages/ 2>/dev/null || true
+          
+          # 强制底层编译链使用特定的 mpv commit
+          sed -i 's|GIT_REPOSITORY https://github.com/mpv-player/mpv.git|GIT_REPOSITORY https://github.com/mpv-player/mpv.git\n    GIT_TAG 7d245fd|' mpv-winbuild-cmake/packages/mpv.cmake
+          
           cd mpv-winbuild-cmake
           if [[ "$(ls -A ../patch/*.patch)" ]]; then
             for patch in ../patch/*.patch ; do
