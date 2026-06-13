@@ -397,7 +397,7 @@ jobs:
           fi
           
           # 在应用完所有针对工具链的补丁后，再修改 mpv.cmake，以防 git am 报错
-          sed -i 's|GIT_REPOSITORY https://github.com/mpv-player/mpv.git|GIT_REPOSITORY https://github.com/mpv-player/mpv.git\n    GIT_TAG 7d245fd|' packages/mpv.cmake
+          sed -i 's|GIT_REPOSITORY https://github.com/mpv-player/mpv.git|GIT_REPOSITORY https://github.com/mpv-player/mpv.git\n    GIT_TAG 7d245fd\n    PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch|' packages/mpv.cmake
           
           bash ../build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
       - name: Collect logs
