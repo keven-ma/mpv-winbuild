@@ -1,4 +1,4 @@
-From bda39828f2b235748ed60505e5666faa4f9260c5 Mon Sep 17 00:00:00 2001
+From 583bac22c97b4f6e5c30a602d5fb8e4f4375e5ef Mon Sep 17 00:00:00 2001
 From: keven-ma <60804914+keven-ma@users.noreply.github.com>
 Date: Sat, 13 Jun 2026 14:27:21 +0800
 Subject: [PATCH] sync server time for mpv
@@ -6,6 +6,10 @@ Subject: [PATCH] sync server time for mpv
 ---
  include/mpv/client.h |  86 ++++++++++++++++
  meson.build          |   1 +
+ osdep/timer-darwin.c |   6 ++
+ osdep/timer-linux.c  |   6 ++
+ osdep/timer-win32.c  |   8 ++
+ osdep/timer.h        |   2 +
  player/client.c      |  35 +++++++
  player/command.c     |  99 +++++++++++++++++-
  player/core.h        |   3 +
@@ -15,7 +19,7 @@ Subject: [PATCH] sync server time for mpv
  player/server_sync.c | 236 +++++++++++++++++++++++++++++++++++++++++++
  player/server_sync.h | 135 +++++++++++++++++++++++++
  player/video.c       |  15 +++
- 11 files changed, 671 insertions(+), 1 deletion(-)
+ 15 files changed, 693 insertions(+), 1 deletion(-)
  create mode 100644 player/server_sync.c
  create mode 100644 player/server_sync.h
 
@@ -128,6 +132,66 @@ index 1cd2570f0d..b923439e5b 100644
      'player/command.c',
      'player/configfiles.c',
      'player/external_files.c',
+diff --git a/osdep/timer-darwin.c b/osdep/timer-darwin.c
+index 36e719425e..4d3fb8aa32 100644
+--- a/osdep/timer-darwin.c
++++ b/osdep/timer-darwin.c
+@@ -51,3 +51,9 @@ void mp_raw_time_init(void)
+     mach_timebase_info(&timebase);
+     timebase_ratio_ns = (double)timebase.numer / (double)timebase.denom;
+ }
++
++int64_t mp_sys_time_us(void) {
++    struct timeval tv;
++    gettimeofday(&tv, NULL);
++    return (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
++}
+diff --git a/osdep/timer-linux.c b/osdep/timer-linux.c
+index 559a496636..01f4618347 100644
+--- a/osdep/timer-linux.c
++++ b/osdep/timer-linux.c
+@@ -62,3 +62,9 @@ void mp_raw_time_init(void)
+     fputs("No clock source available!\n", stderr);
+     abort();
+ }
++
++int64_t mp_sys_time_us(void) {
++    struct timeval tv;
++    gettimeofday(&tv, NULL);
++    return (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
++}
+diff --git a/osdep/timer-win32.c b/osdep/timer-win32.c
+index 598c81998f..a2bc3a1c74 100644
+--- a/osdep/timer-win32.c
++++ b/osdep/timer-win32.c
+@@ -154,6 +154,14 @@ void mp_raw_time_init(void)
+ #endif
+ }
+ 
++int64_t mp_sys_time_us(void) {
++    FILETIME ft;
++    int64_t t;
++    GetSystemTimeAsFileTime(&ft);
++    t = (int64_t)ft.dwHighDateTime << 32 | ft.dwLowDateTime;
++    return t / 10 - 11644473600000000; /* Jan 1, 1601 */
++}
++
+ #if !HAVE_UWP && !defined(__aarch64__) && !defined(_M_ARM64)
+ 
+ static inline bool cpu_tsc_invariant(void)
+diff --git a/osdep/timer.h b/osdep/timer.h
+index 24e6fd6763..7b5c0a9bb4 100644
+--- a/osdep/timer.h
++++ b/osdep/timer.h
+@@ -39,6 +39,8 @@ void mp_raw_time_init(void);
+ // ensure this doesn't return 0
+ uint64_t mp_raw_time_ns(void);
+ 
++int64_t mp_sys_time_us(void);
++
+ // Sleep in nanoseconds.
+ void mp_sleep_ns(int64_t ns);
+ 
 diff --git a/player/client.c b/player/client.c
 index 61c998dbb8..a8fd064ef6 100644
 --- a/player/client.c
