@@ -1,4 +1,4 @@
-From a569c804b72e38ab637ed62c5f8852f9f143da81 Mon Sep 17 00:00:00 2001
+From 849c40ca7a23aaaab54d45f196ade464009b88d2 Mon Sep 17 00:00:00 2001
 From: keven-ma <60804914+keven-ma@users.noreply.github.com>
 Date: Sat, 13 Jun 2026 14:27:21 +0800
 Subject: [PATCH] sync server time for mpv
@@ -20,8 +20,8 @@ Subject: [PATCH] sync server time for mpv
  player/playloop.c    |  15 +++
  player/server_sync.c | 248 +++++++++++++++++++++++++++++++++++++++++++
  player/server_sync.h | 137 ++++++++++++++++++++++++
- player/video.c       |  30 +++++-
- 17 files changed, 690 insertions(+), 5 deletions(-)
+ player/video.c       |  36 ++++++-
+ 17 files changed, 696 insertions(+), 5 deletions(-)
  create mode 100644 player/server_sync.c
  create mode 100644 player/server_sync.h
 
@@ -913,7 +913,7 @@ index 0000000000..8bde3d56a4
 +
 +#endif
 diff --git a/player/video.c b/player/video.c
-index 820bbfbf6c..ea043d2142 100644
+index 820bbfbf6c..9b9b98e91c 100644
 --- a/player/video.c
 +++ b/player/video.c
 @@ -598,7 +598,8 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
@@ -959,7 +959,7 @@ index 820bbfbf6c..ea043d2142 100644
      }
  }
  
-@@ -1249,6 +1258,21 @@ void write_video(struct MPContext *mpctx)
+@@ -1249,6 +1258,27 @@ void write_video(struct MPContext *mpctx)
      mpctx->last_frame_duration =
          mpctx->next_frames[0]->pkt_duration / mpctx->video_speed;
  
@@ -970,11 +970,17 @@ index 820bbfbf6c..ea043d2142 100644
 +                             memory_order_relaxed))
 +    {
 +        double sv_time = mp_ntp_clock_get_ntp_time(&mpctx->ntp_clock);
-+        // mpctx->playback_pts (get_current_time) lags by 1 frame here because
-+        // handle_playback_time runs after write_video. Since we are in write_video,
-+        // video_pts is exactly what playback_pts will become.
++        // mpctx->video_pts is the presentation time of the frame about to be queued.
++        // We subtract the VO delay to obtain the exact PTS currently on screen.
++        double playing_video_pts = mpctx->video_pts;
++        if (playing_video_pts != MP_NOPTS_VALUE) {
++            double vo_delay = vo_get_delay(vo);
++            if (vo_delay >= 0)
++                playing_video_pts -= vo_delay * mpctx->video_speed;
++        }
++
 +        mp_ntp_clock_commit_pts(&mpctx->ntp_clock,
-+                                         sv_time, mpctx->video_pts, playing_audio_pts(mpctx),
++                                         sv_time, playing_video_pts, playing_audio_pts(mpctx),
 +                                         mpctx->paused);
 +    }
 +
