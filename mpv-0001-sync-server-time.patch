@@ -1,33 +1,33 @@
-From ef4d6b34ee993ac115e4cda4181faf26258650be Mon Sep 17 00:00:00 2001
+From 04bca21f0bd2f34bf6bd8df795855e32f7a6ed87 Mon Sep 17 00:00:00 2001
 From: keven-ma <60804914+keven-ma@users.noreply.github.com>
 Date: Sat, 13 Jun 2026 14:27:21 +0800
 Subject: [PATCH] sync server time for mpv
 
 ---
- include/mpv/client.h |  86 ++++++++++++++++
+ include/mpv/client.h |  89 ++++++++++++++++
  meson.build          |   1 +
  osdep/timer-darwin.c |   6 ++
  osdep/timer-linux.c  |   6 ++
  osdep/timer-win32.c  |   8 ++
  osdep/timer.h        |   2 +
- player/client.c      |  35 +++++++
- player/command.c     |  99 +++++++++++++++++-
+ player/client.c      |  37 +++++++
+ player/command.c     | 100 ++++++++++++++++-
  player/core.h        |   3 +
  player/loadfile.c    |   8 ++
  player/main.c        |   1 +
  player/playloop.c    |  15 +++
- player/server_sync.c | 236 +++++++++++++++++++++++++++++++++++++++++++
- player/server_sync.h | 135 +++++++++++++++++++++++++
+ player/server_sync.c | 248 +++++++++++++++++++++++++++++++++++++++++++
+ player/server_sync.h | 137 ++++++++++++++++++++++++
  player/video.c       |  15 +++
- 15 files changed, 655 insertions(+), 1 deletion(-)
+ 15 files changed, 675 insertions(+), 1 deletion(-)
  create mode 100644 player/server_sync.c
  create mode 100644 player/server_sync.h
 
 diff --git a/include/mpv/client.h b/include/mpv/client.h
-index f72a0e0a46..d0b17ccc91 100644
+index f72a0e0a46..22251c9251 100644
 --- a/include/mpv/client.h
 +++ b/include/mpv/client.h
-@@ -622,6 +622,92 @@ MPV_EXPORT int64_t mpv_get_time_ns(mpv_handle *ctx);
+@@ -622,6 +622,95 @@ MPV_EXPORT int64_t mpv_get_time_ns(mpv_handle *ctx);
   */
  MPV_EXPORT int64_t mpv_get_time_us(mpv_handle *ctx);
  
@@ -87,13 +87,13 @@ index f72a0e0a46..d0b17ccc91 100644
 +MPV_EXPORT double mpv_server_clock_get(mpv_handle *ctx);
 +
 +/**
-+ * Get the last committed video frame position paired with the server time at
-+ * which it was captured.  This triple is guaranteed to be perfectly consistent:
-+ * at server time *out_server_time, the client's video was at *out_video_pts
-+ * and the pause state was *out_is_paused.
++ * Get the last committed video and audio frame position paired with the server time at
++ * which it was captured.  This tuple is guaranteed to be perfectly consistent:
++ * at server time *out_server_time, the client's video was at *out_video_pts,
++ * the audio was at *out_audio_pts, and the pause state was *out_is_paused.
 + *
 + * The value may be up to one video frame behind the actual current position,
-+ * but the three output values always correspond to the same instant — they are
++ * but the output values always correspond to the same instant — they are
 + * written atomically inside the playback thread via a seqlock.
 + *
 + * Typical use on a master node: call mpv_server_clock_sync() periodically,
@@ -104,6 +104,8 @@ index f72a0e0a46..d0b17ccc91 100644
 + *                         Must not be NULL.
 + * @param out_video_pts    Set to the video position (seconds) at that time.
 + *                         Must not be NULL.
++ * @param out_audio_pts    Set to the audio position (seconds) at that time.
++ *                         Must not be NULL.
 + * @param out_is_paused    Set to non-zero if the player was paused at snapshot
 + *                         time.  Must not be NULL.
 + * @return 0 on success; -1 if no snapshot is available yet (call
@@ -111,10 +113,11 @@ index f72a0e0a46..d0b17ccc91 100644
 + *
 + * Safe to be called from any thread. Lock-free.
 + */
-+MPV_EXPORT int mpv_get_video_sync_point(mpv_handle *ctx,
-+                                         double *out_server_time,
-+                                         double *out_video_pts,
-+                                         int    *out_is_paused);
++MPV_EXPORT int mpv_get_sync_point(mpv_handle *ctx,
++                                   double *out_server_time,
++                                   double *out_video_pts,
++                                   double *out_audio_pts,
++                                   int    *out_is_paused);
 +
 +
  /**
@@ -193,7 +196,7 @@ index 24e6fd6763..7b5c0a9bb4 100644
  void mp_sleep_ns(int64_t ns);
  
 diff --git a/player/client.c b/player/client.c
-index 61c998dbb8..a8fd064ef6 100644
+index 61c998dbb8..db58093f2f 100644
 --- a/player/client.c
 +++ b/player/client.c
 @@ -46,6 +46,7 @@
@@ -204,7 +207,7 @@ index 61c998dbb8..a8fd064ef6 100644
  
  /*
   * Locking hierarchy:
-@@ -2140,6 +2141,40 @@ int64_t mpv_get_time_us(mpv_handle *ctx)
+@@ -2140,6 +2141,42 @@ int64_t mpv_get_time_us(mpv_handle *ctx)
      return mp_time_ns() / 1000;
  }
  
@@ -227,15 +230,17 @@ index 61c998dbb8..a8fd064ef6 100644
 +    return mp_ntp_clock_get_ntp_time(&ctx->mpctx->ntp_clock);
 +}
 +
-+int mpv_get_video_sync_point(mpv_handle *ctx,
-+                              double *out_ntp_time,
-+                              double *out_video_pts,
-+                              int    *out_is_paused)
++int mpv_get_sync_point(mpv_handle *ctx,
++                        double *out_ntp_time,
++                        double *out_video_pts,
++                        double *out_audio_pts,
++                        int    *out_is_paused)
 +{
 +    bool paused;
-+    bool ok = mp_ntp_clock_get_video_pts(&ctx->mpctx->ntp_clock,
++    bool ok = mp_ntp_clock_get_pts(&ctx->mpctx->ntp_clock,
 +                                             out_ntp_time,
 +                                             out_video_pts,
++                                             out_audio_pts,
 +                                             &paused);
 +    if (ok)
 +        *out_is_paused = paused ? 1 : 0;
@@ -246,10 +251,10 @@ index 61c998dbb8..a8fd064ef6 100644
  
  static void do_kill(void *ptr)
 diff --git a/player/command.c b/player/command.c
-index 0dea4bfc94..20ab28e680 100644
+index 0dea4bfc94..b322ad8adb 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -4601,6 +4601,68 @@ static int mp_property_clipboard(void *ctx, struct m_property *prop,
+@@ -4601,6 +4601,69 @@ static int mp_property_clipboard(void *ctx, struct m_property *prop,
  #define M_PROPERTY_DEPRECATED_ALIAS(name, real_property) \
      {(name), mp_property_deprecated_alias, .priv = (real_property)}
  
@@ -301,15 +306,16 @@ index 0dea4bfc94..20ab28e680 100644
 +    if (action != M_PROPERTY_GET)
 +        return M_PROPERTY_NOT_IMPLEMENTED;
 +
-+    double ntp_time, video_pts;
++    double ntp_time, video_pts, audio_pts;
 +    bool is_paused;
-+    if (!mp_ntp_clock_get_video_pts(&mpctx->ntp_clock, &ntp_time, &video_pts, &is_paused))
++    if (!mp_ntp_clock_get_pts(&mpctx->ntp_clock, &ntp_time, &video_pts, &audio_pts, &is_paused))
 +        return M_PROPERTY_UNAVAILABLE;
 +
 +    struct mpv_node node = {0};
 +    node_init(&node, MPV_FORMAT_NODE_MAP, NULL);
 +    node_map_add_double(&node, "ntp-time",    ntp_time * 1000.0);
 +    node_map_add_double(&node, "video-pts",   video_pts);
++    node_map_add_double(&node, "audio-pts",   audio_pts);
 +    node_map_add_flag(&node,   "is-paused",   is_paused);
 +    *(struct mpv_node *)arg = node;
 +    return M_PROPERTY_OK;
@@ -318,7 +324,7 @@ index 0dea4bfc94..20ab28e680 100644
  // Base list of properties. This does not include option-mapped properties.
  static const struct m_property mp_properties_base[] = {
      // General
-@@ -4641,6 +4703,8 @@ static const struct m_property mp_properties_base[] = {
+@@ -4641,6 +4704,8 @@ static const struct m_property mp_properties_base[] = {
      {"remaining-ab-loops", mp_property_remaining_ab_loops},
      {"chapter", mp_property_chapter},
      {"edition", mp_property_edition},
@@ -327,7 +333,7 @@ index 0dea4bfc94..20ab28e680 100644
      {"current-edition", mp_property_current_edition},
      {"chapters", mp_property_chapters},
      {"editions", mp_property_editions},
-@@ -4857,7 +4921,8 @@ static const char *const *const mp_event_property_change[] = {
+@@ -4857,7 +4922,8 @@ static const char *const *const mp_event_property_change[] = {
        "decoder-frame-drop-count", "frame-drop-count", "video-frame-info",
        "vf-metadata", "af-metadata", "sub-start", "sub-end", "secondary-sub-start",
        "secondary-sub-end", "sub-lines", "secondary-sub-lines", "video-out-params",
@@ -337,7 +343,7 @@ index 0dea4bfc94..20ab28e680 100644
      E(MP_EVENT_DURATION_UPDATE, "duration"),
      E(MPV_EVENT_VIDEO_RECONFIG, "video-out-params", "video-params",
        "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
-@@ -7447,12 +7512,44 @@ static void cmd_notify_property(void *p)
+@@ -7447,12 +7513,44 @@ static void cmd_notify_property(void *p)
   * Lua with mp.command_native().
   */
  
@@ -442,7 +448,7 @@ index 6891c9d5a1..13322cb523 100644
      mpctx->global = talloc_zero(mpctx, struct mpv_global);
  
 diff --git a/player/playloop.c b/player/playloop.c
-index d899fba123..5bc5c9f909 100644
+index d899fba123..a2452c4dd8 100644
 --- a/player/playloop.c
 +++ b/player/playloop.c
 @@ -26,6 +26,7 @@
@@ -466,8 +472,8 @@ index d899fba123..5bc5c9f909 100644
 +        mpctx->video_pts != MP_NOPTS_VALUE)
 +    {
 +        double sv_time = mp_ntp_clock_get_ntp_time(&mpctx->ntp_clock);
-+        mp_ntp_clock_commit_video_pts(&mpctx->ntp_clock,
-+                                         sv_time, mpctx->video_pts,
++        mp_ntp_clock_commit_pts(&mpctx->ntp_clock,
++                                         sv_time, mpctx->video_pts, playing_audio_pts(mpctx),
 +                                         mpctx->paused);
 +    }
 +
@@ -476,10 +482,10 @@ index d899fba123..5bc5c9f909 100644
  
 diff --git a/player/server_sync.c b/player/server_sync.c
 new file mode 100644
-index 0000000000..42947a9dbe
+index 0000000000..d2e357a3ee
 --- /dev/null
 +++ b/player/server_sync.c
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,248 @@
 +#include "server_sync.h"
 +#include <math.h>
 +
@@ -503,7 +509,8 @@ index 0000000000..42947a9dbe
 +
 +    atomic_init(&sc->vpts_seq, 0);
 +    atomic_init(&sc->vpts_server_us, 0);
-+    atomic_init(&sc->vpts_pts_us, 0);
++    atomic_init(&sc->vpts_video_pts_us, 0);
++    atomic_init(&sc->vpts_audio_pts_us, 0);
 +    atomic_init(&sc->vpts_paused, 0);
 +
 +    sc->pid_integral      = 0.0;
@@ -642,7 +649,8 @@ index 0000000000..42947a9dbe
 +    // vpts seqlock snapshot — reset to "never committed" (seq = 0)
 +    atomic_store_explicit(&sc->vpts_seq, 0, memory_order_relaxed);
 +    atomic_store_explicit(&sc->vpts_server_us, 0, memory_order_relaxed);
-+    atomic_store_explicit(&sc->vpts_pts_us, 0, memory_order_relaxed);
++    atomic_store_explicit(&sc->vpts_video_pts_us, 0, memory_order_relaxed);
++    atomic_store_explicit(&sc->vpts_audio_pts_us, 0, memory_order_relaxed);
 +    atomic_store_explicit(&sc->vpts_paused, 0, memory_order_relaxed);
 +
 +    // PID controller
@@ -650,10 +658,10 @@ index 0000000000..42947a9dbe
 +}
 +
 +// Seqlock writer: called from the playback thread (single writer).
-+// Writes an atomic (ntp_time, video_pts, is_paused) snapshot.
-+void mp_ntp_clock_commit_video_pts(struct mp_ntp_clock *sc,
-+                                       double ntp_time, double video_pts,
-+                                       bool is_paused)
++// Writes an atomic (ntp_time, video_pts, audio_pts, is_paused) snapshot.
++void mp_ntp_clock_commit_pts(struct mp_ntp_clock *sc,
++                                 double ntp_time, double video_pts, double audio_pts,
++                                 bool is_paused)
 +{
 +    if (!atomic_load(&sc->clock_valid))
 +        return;
@@ -669,8 +677,11 @@ index 0000000000..42947a9dbe
 +    atomic_store_explicit(&sc->vpts_server_us,
 +                          (int64_t)(ntp_time * 1000000.0),
 +                          memory_order_relaxed);
-+    atomic_store_explicit(&sc->vpts_pts_us,
++    atomic_store_explicit(&sc->vpts_video_pts_us,
 +                          (int64_t)(video_pts   * 1000000.0),
++                          memory_order_relaxed);
++    atomic_store_explicit(&sc->vpts_audio_pts_us,
++                          (int64_t)(audio_pts   * 1000000.0),
 +                          memory_order_relaxed);
 +    atomic_store_explicit(&sc->vpts_paused,
 +                          (int32_t)is_paused,
@@ -683,10 +694,11 @@ index 0000000000..42947a9dbe
 +}
 +
 +// Seqlock reader: safe to call from any thread.
-+bool mp_ntp_clock_get_video_pts(struct mp_ntp_clock *sc,
-+                                    double *out_ntp_time,
-+                                    double *out_video_pts,
-+                                    bool   *out_is_paused)
++bool mp_ntp_clock_get_pts(struct mp_ntp_clock *sc,
++                              double *out_ntp_time,
++                              double *out_video_pts,
++                              double *out_audio_pts,
++                              bool   *out_is_paused)
 +{
 +    for (;;) {
 +        // Acquire-load ensures we see the latest seq before reading payload.
@@ -699,7 +711,8 @@ index 0000000000..42947a9dbe
 +            continue;  // write in progress — spin
 +
 +        int64_t st      = atomic_load_explicit(&sc->vpts_server_us, memory_order_relaxed);
-+        int64_t pts     = atomic_load_explicit(&sc->vpts_pts_us,    memory_order_relaxed);
++        int64_t pts     = atomic_load_explicit(&sc->vpts_video_pts_us,    memory_order_relaxed);
++        int64_t apts    = atomic_load_explicit(&sc->vpts_audio_pts_us, memory_order_relaxed);
 +        int32_t paused  = atomic_load_explicit(&sc->vpts_paused,    memory_order_relaxed);
 +
 +        // Acquire fence then re-read seq to detect concurrent write.
@@ -709,19 +722,24 @@ index 0000000000..42947a9dbe
 +        if (seq1 != seq2)
 +            continue;  // writer updated during our read — retry
 +
-+        *out_ntp_time = (double)st  / 1000000.0;
-+        *out_video_pts   = (double)pts / 1000000.0;
-+        *out_is_paused   = (bool)paused;
++        if (out_ntp_time)
++            *out_ntp_time = (double)st  / 1000000.0;
++        if (out_video_pts)
++            *out_video_pts   = (double)pts / 1000000.0;
++        if (out_audio_pts)
++            *out_audio_pts   = (double)apts / 1000000.0;
++        if (out_is_paused)
++            *out_is_paused   = (bool)paused;
 +        return true;
 +    }
 +}
 +
 diff --git a/player/server_sync.h b/player/server_sync.h
 new file mode 100644
-index 0000000000..77f657f628
+index 0000000000..8bde3d56a4
 --- /dev/null
 +++ b/player/server_sync.h
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,137 @@
 +#ifndef MP_SERVER_SYNC_H
 +#define MP_SERVER_SYNC_H
 +
@@ -791,12 +809,13 @@ index 0000000000..77f657f628
 +    atomic_uint_least64_t stat_frames_diff_50;
 +    atomic_uint_least64_t stat_frames_diff_68;
 +
-+    // Committed video PTS sync point (seqlock: odd = writing, even = done, 0 = never set)
-+    // Guarantees that (vpts_server_us, vpts_pts_us, vpts_paused) are always a consistent
++    // Committed PTS sync point (seqlock: odd = writing, even = done, 0 = never set)
++    // Guarantees that (vpts_server_us, vpts_video_pts_us, vpts_audio_pts_us, vpts_paused) are always a consistent
 +    // snapshot: "at server time X, video was at position Y and pause state was Z"
 +    atomic_uint_least64_t vpts_seq;        // seqlock generation counter
 +    atomic_int_least64_t  vpts_server_us;  // server time when snapshot was taken (microseconds)
-+    atomic_int_least64_t  vpts_pts_us;     // video_pts at that server time (microseconds)
++    atomic_int_least64_t  vpts_video_pts_us; // video_pts at that server time (microseconds)
++    atomic_int_least64_t  vpts_audio_pts_us; // audio_pts at that server time (microseconds)
 +    atomic_int_least32_t  vpts_paused;     // paused state at snapshot time (0 or 1)
 +
 +    // ── PID controller state ────────────────────────────────────────────────
@@ -839,26 +858,27 @@ index 0000000000..77f657f628
 +// Safe to call from the playback thread.
 +void mp_ntp_clock_reset(struct mp_ntp_clock *sc);
 +
-+// Commit an atomic (ntp_time, video_pts, is_paused) snapshot.
++// Commit an atomic (ntp_time, video_pts, audio_pts, is_paused) snapshot.
 +// Call this whenever video_pts or pause state changes (from the playback thread).
 +// Lock-free using a seqlock — safe to call from the playback thread.
-+void mp_ntp_clock_commit_video_pts(struct mp_ntp_clock *sc,
-+                                       double ntp_time, double video_pts,
-+                                       bool is_paused);
++void mp_ntp_clock_commit_pts(struct mp_ntp_clock *sc,
++                                 double ntp_time, double video_pts, double audio_pts,
++                                 bool is_paused);
 +
 +// Read the last committed snapshot.
 +// Returns true if a valid snapshot exists, false if none has been committed yet.
-+// The returned triple is guaranteed to be internally consistent:
-+// at ntp_time X, video was exactly at video_pts Y with pause state Z.
++// The returned tuple is guaranteed to be internally consistent:
++// at ntp_time X, video was exactly at video_pts Y, audio was exactly at audio_pts, with pause state Z.
 +// Lock-free using a seqlock — safe to call from any thread.
-+bool mp_ntp_clock_get_video_pts(struct mp_ntp_clock *sc,
-+                                    double *out_ntp_time,
-+                                    double *out_video_pts,
-+                                    bool   *out_is_paused);
++bool mp_ntp_clock_get_pts(struct mp_ntp_clock *sc,
++                              double *out_ntp_time,
++                              double *out_video_pts,
++                              double *out_audio_pts,
++                              bool   *out_is_paused);
 +
 +#endif
 diff --git a/player/video.c b/player/video.c
-index 820bbfbf6c..14e7402a98 100644
+index 820bbfbf6c..70d2a36a07 100644
 --- a/player/video.c
 +++ b/player/video.c
 @@ -1249,6 +1249,21 @@ void write_video(struct MPContext *mpctx)
@@ -875,8 +895,8 @@ index 820bbfbf6c..14e7402a98 100644
 +        // mpctx->playback_pts (get_current_time) lags by 1 frame here because
 +        // handle_playback_time runs after write_video. Since we are in write_video,
 +        // video_pts is exactly what playback_pts will become.
-+        mp_ntp_clock_commit_video_pts(&mpctx->ntp_clock,
-+                                         sv_time, mpctx->video_pts,
++        mp_ntp_clock_commit_pts(&mpctx->ntp_clock,
++                                         sv_time, mpctx->video_pts, playing_audio_pts(mpctx),
 +                                         mpctx->paused);
 +    }
 +
