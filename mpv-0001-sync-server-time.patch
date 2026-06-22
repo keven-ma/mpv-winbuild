@@ -1,4 +1,4 @@
-From 849c40ca7a23aaaab54d45f196ade464009b88d2 Mon Sep 17 00:00:00 2001
+From 8bdcdcf145144eb3ae09f5c2895d699cda64143f Mon Sep 17 00:00:00 2001
 From: keven-ma <60804914+keven-ma@users.noreply.github.com>
 Date: Sat, 13 Jun 2026 14:27:21 +0800
 Subject: [PATCH] sync server time for mpv
@@ -17,11 +17,11 @@ Subject: [PATCH] sync server time for mpv
  player/core.h        |   3 +
  player/loadfile.c    |   8 ++
  player/main.c        |   1 +
- player/playloop.c    |  15 +++
+ player/playloop.c    |  27 +++++
  player/server_sync.c | 248 +++++++++++++++++++++++++++++++++++++++++++
  player/server_sync.h | 137 ++++++++++++++++++++++++
- player/video.c       |  36 ++++++-
- 17 files changed, 696 insertions(+), 5 deletions(-)
+ player/video.c       |  15 ++-
+ 17 files changed, 687 insertions(+), 5 deletions(-)
  create mode 100644 player/server_sync.c
  create mode 100644 player/server_sync.h
 
@@ -483,7 +483,7 @@ index 6891c9d5a1..13322cb523 100644
      mpctx->global = talloc_zero(mpctx, struct mpv_global);
  
 diff --git a/player/playloop.c b/player/playloop.c
-index d899fba123..a2452c4dd8 100644
+index d899fba123..299088f01d 100644
 --- a/player/playloop.c
 +++ b/player/playloop.c
 @@ -26,6 +26,7 @@
@@ -515,6 +515,32 @@ index d899fba123..a2452c4dd8 100644
      m_config_notify_change_opt_ptr(mpctx->mconfig, &opts->pause);
  }
  
+@@ -1127,6 +1142,8 @@ static void handle_dummy_ticks(struct MPContext *mpctx)
+ // Update current playback time.
+ static void handle_playback_time(struct MPContext *mpctx)
+ {
++    double old_pts = mpctx->playback_pts;
++
+     if (mpctx->vo_chain &&
+         !mpctx->vo_chain->is_sparse &&
+         mpctx->video_status >= STATUS_PLAYING &&
+@@ -1146,6 +1163,16 @@ static void handle_playback_time(struct MPContext *mpctx)
+         if (mpts != MP_NOPTS_VALUE)
+             mpctx->playback_pts = mpts;
+     }
++
++    if (mpctx->playback_pts != old_pts && mpctx->playback_pts != MP_NOPTS_VALUE) {
++        if (atomic_load_explicit(&mpctx->ntp_clock.clock_valid, memory_order_relaxed)) {
++            double sv_time = mp_ntp_clock_get_ntp_time(&mpctx->ntp_clock);
++            // 这里统一使用统一且纯粹的 logical playback_pts (video 或 audio 均可兼顾)
++            mp_ntp_clock_commit_pts(&mpctx->ntp_clock,
++                                    sv_time, mpctx->playback_pts, playing_audio_pts(mpctx),
++                                    mpctx->paused);
++        }
++    }
+ }
+ 
+ // We always make sure audio and video buffers are filled before actually
 diff --git a/player/server_sync.c b/player/server_sync.c
 new file mode 100644
 index 0000000000..d2e357a3ee
@@ -913,7 +939,7 @@ index 0000000000..8bde3d56a4
 +
 +#endif
 diff --git a/player/video.c b/player/video.c
-index 820bbfbf6c..9b9b98e91c 100644
+index 820bbfbf6c..cb44935c4c 100644
 --- a/player/video.c
 +++ b/player/video.c
 @@ -598,7 +598,8 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
@@ -959,34 +985,6 @@ index 820bbfbf6c..9b9b98e91c 100644
      }
  }
  
-@@ -1249,6 +1258,27 @@ void write_video(struct MPContext *mpctx)
-     mpctx->last_frame_duration =
-         mpctx->next_frames[0]->pkt_duration / mpctx->video_speed;
- 
-+    // Commit an atomic (ntp_time, video_pts, is_paused) snapshot for external query.
-+    // We capture server time at exactly the same moment video_pts is updated,
-+    // guaranteeing the triple is perfectly consistent.
-+    if (atomic_load_explicit(&mpctx->ntp_clock.clock_valid,
-+                             memory_order_relaxed))
-+    {
-+        double sv_time = mp_ntp_clock_get_ntp_time(&mpctx->ntp_clock);
-+        // mpctx->video_pts is the presentation time of the frame about to be queued.
-+        // We subtract the VO delay to obtain the exact PTS currently on screen.
-+        double playing_video_pts = mpctx->video_pts;
-+        if (playing_video_pts != MP_NOPTS_VALUE) {
-+            double vo_delay = vo_get_delay(vo);
-+            if (vo_delay >= 0)
-+                playing_video_pts -= vo_delay * mpctx->video_speed;
-+        }
-+
-+        mp_ntp_clock_commit_pts(&mpctx->ntp_clock,
-+                                         sv_time, playing_video_pts, playing_audio_pts(mpctx),
-+                                         mpctx->paused);
-+    }
-+
-     shift_frames(mpctx);
- 
-     schedule_frame(mpctx, frame);
 -- 
 2.47.0.windows.1
 
