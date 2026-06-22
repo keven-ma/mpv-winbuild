@@ -1,4 +1,4 @@
-From d3489aef82a48cce1d6f49b30cd8e03a2033037c Mon Sep 17 00:00:00 2001
+From a569c804b72e38ab637ed62c5f8852f9f143da81 Mon Sep 17 00:00:00 2001
 From: keven-ma <60804914+keven-ma@users.noreply.github.com>
 Date: Sat, 13 Jun 2026 14:27:21 +0800
 Subject: [PATCH] sync server time for mpv
@@ -7,7 +7,7 @@ Subject: [PATCH] sync server time for mpv
  common/common.h      |   1 +
  include/mpv/client.h |  89 ++++++++++++++++
  meson.build          |   1 +
- options/options.c    |   1 +
+ options/options.c    |   3 +-
  osdep/timer-darwin.c |   6 ++
  osdep/timer-linux.c  |   6 ++
  osdep/timer-win32.c  |   8 ++
@@ -21,7 +21,7 @@ Subject: [PATCH] sync server time for mpv
  player/server_sync.c | 248 +++++++++++++++++++++++++++++++++++++++++++
  player/server_sync.h | 137 ++++++++++++++++++++++++
  player/video.c       |  30 +++++-
- 17 files changed, 689 insertions(+), 4 deletions(-)
+ 17 files changed, 690 insertions(+), 5 deletions(-)
  create mode 100644 player/server_sync.c
  create mode 100644 player/server_sync.h
 
@@ -150,7 +150,7 @@ index 1cd2570f0d..b923439e5b 100644
      'player/configfiles.c',
      'player/external_files.c',
 diff --git a/options/options.c b/options/options.c
-index 48baef13ff..5b4a2fe58b 100644
+index 48baef13ff..380d5864ef 100644
 --- a/options/options.c
 +++ b/options/options.c
 @@ -199,6 +199,7 @@ static const m_option_t mp_vo_opt_list[] = {
@@ -161,6 +161,15 @@ index 48baef13ff..5b4a2fe58b 100644
          {"desync", VS_NONE})},
  #if HAVE_X11
      {"x11-netwm", OPT_CHOICE(x11_netwm, {"auto", 0}, {"no", -1}, {"yes", 1})},
+@@ -872,7 +873,7 @@ static const m_option_t mp_opts[] = {
+     {"video-sync-max-video-change", OPT_DOUBLE(sync_max_video_change),
+         M_RANGE(0, DBL_MAX)},
+     {"video-sync-max-audio-change", OPT_DOUBLE(sync_max_audio_change),
+-        M_RANGE(0, 1)},
++        M_RANGE(0, 100)},
+     {"video-sync-max-factor", OPT_INT(sync_max_factor), M_RANGE(1, 10)},
+     {"hr-seek", OPT_CHOICE(hr_seek,
+         {"no", -1}, {"absolute", 0}, {"yes", 1}, {"always", 1}, {"default", 2})},
 diff --git a/osdep/timer-darwin.c b/osdep/timer-darwin.c
 index 36e719425e..4d3fb8aa32 100644
 --- a/osdep/timer-darwin.c
