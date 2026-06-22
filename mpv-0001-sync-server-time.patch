@@ -1,11 +1,13 @@
-From 04bca21f0bd2f34bf6bd8df795855e32f7a6ed87 Mon Sep 17 00:00:00 2001
+From d3489aef82a48cce1d6f49b30cd8e03a2033037c Mon Sep 17 00:00:00 2001
 From: keven-ma <60804914+keven-ma@users.noreply.github.com>
 Date: Sat, 13 Jun 2026 14:27:21 +0800
 Subject: [PATCH] sync server time for mpv
 
 ---
+ common/common.h      |   1 +
  include/mpv/client.h |  89 ++++++++++++++++
  meson.build          |   1 +
+ options/options.c    |   1 +
  osdep/timer-darwin.c |   6 ++
  osdep/timer-linux.c  |   6 ++
  osdep/timer-win32.c  |   8 ++
@@ -18,11 +20,23 @@ Subject: [PATCH] sync server time for mpv
  player/playloop.c    |  15 +++
  player/server_sync.c | 248 +++++++++++++++++++++++++++++++++++++++++++
  player/server_sync.h | 137 ++++++++++++++++++++++++
- player/video.c       |  15 +++
- 15 files changed, 675 insertions(+), 1 deletion(-)
+ player/video.c       |  30 +++++-
+ 17 files changed, 689 insertions(+), 4 deletions(-)
  create mode 100644 player/server_sync.c
  create mode 100644 player/server_sync.h
 
+diff --git a/common/common.h b/common/common.h
+index 5f56c60cdc..7f1b698c65 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -88,6 +88,7 @@ enum video_sync {
+     VS_DISP_ADROP,
+     VS_DISP_VDROP,
+     VS_DISP_NONE,
++    VS_SYSCLOCK_RESAMPLE,
+     VS_NONE,
+ };
+ 
 diff --git a/include/mpv/client.h b/include/mpv/client.h
 index f72a0e0a46..22251c9251 100644
 --- a/include/mpv/client.h
@@ -135,6 +149,18 @@ index 1cd2570f0d..b923439e5b 100644
      'player/command.c',
      'player/configfiles.c',
      'player/external_files.c',
+diff --git a/options/options.c b/options/options.c
+index 48baef13ff..5b4a2fe58b 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -199,6 +199,7 @@ static const m_option_t mp_vo_opt_list[] = {
+         {"display-adrop", VS_DISP_ADROP},
+         {"display-vdrop", VS_DISP_VDROP},
+         {"display-desync", VS_DISP_NONE},
++        {"sysclock-resample", VS_SYSCLOCK_RESAMPLE},
+         {"desync", VS_NONE})},
+ #if HAVE_X11
+     {"x11-netwm", OPT_CHOICE(x11_netwm, {"auto", 0}, {"no", -1}, {"yes", 1})},
 diff --git a/osdep/timer-darwin.c b/osdep/timer-darwin.c
 index 36e719425e..4d3fb8aa32 100644
 --- a/osdep/timer-darwin.c
@@ -878,10 +904,53 @@ index 0000000000..8bde3d56a4
 +
 +#endif
 diff --git a/player/video.c b/player/video.c
-index 820bbfbf6c..70d2a36a07 100644
+index 820bbfbf6c..ea043d2142 100644
 --- a/player/video.c
 +++ b/player/video.c
-@@ -1249,6 +1249,21 @@ void write_video(struct MPContext *mpctx)
+@@ -598,7 +598,8 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
+ 
+     if (mpctx->video_status < STATUS_READY) {
+         mpctx->time_frame = 0;
+-    } else if (mpctx->display_sync_active || vo->opts->video_sync == VS_NONE) {
++    } else if (mpctx->display_sync_active || vo->opts->video_sync == VS_NONE ||
++               vo->opts->video_sync == VS_SYSCLOCK_RESAMPLE) {
+         // don't touch the timing
+     } else if (mpctx->audio_status == STATUS_PLAYING &&
+                mpctx->video_status == STATUS_PLAYING &&
+@@ -743,7 +744,7 @@ static void adjust_audio_drift_compensation(struct MPContext *mpctx, double vsyn
+     struct MPOpts *opts = mpctx->opts;
+     int mode = mpctx->video_out->opts->video_sync;
+ 
+-    if ((mode != VS_DISP_RESAMPLE && mode != VS_DISP_TEMPO) ||
++    if ((mode != VS_DISP_RESAMPLE && mode != VS_DISP_TEMPO && mode != VS_SYSCLOCK_RESAMPLE) ||
+         mpctx->audio_status != STATUS_PLAYING)
+     {
+         mpctx->speed_factor_a = mpctx->speed_factor_v;
+@@ -798,7 +799,7 @@ static void handle_display_sync_frame(struct MPContext *mpctx,
+     struct vo *vo = mpctx->video_out;
+     int mode = vo->opts->video_sync;
+ 
+-    if (!mpctx->display_sync_active) {
++    if (!mpctx->display_sync_active && mode != VS_SYSCLOCK_RESAMPLE) {
+         mpctx->display_sync_error = 0.0;
+         mpctx->audio_drift_compensation = 0.0;
+         mpctx->avd_filtered = 0;
+@@ -947,6 +948,14 @@ static void schedule_frame(struct MPContext *mpctx, struct vo_frame *frame)
+ 
+         update_av_diff(mpctx, mpctx->time_frame > 0 ?
+             mpctx->time_frame * mpctx->video_speed : 0);
++
++        if (mpctx->video_out->opts->video_sync == VS_SYSCLOCK_RESAMPLE) {
++            double fdur = mpctx->past_frames[0].approx_duration;
++            if (fdur > 0)
++                adjust_audio_drift_compensation(mpctx, fdur / mpctx->opts->playback_speed);
++            if (mpctx->video_status != STATUS_SYNCING)
++                update_playback_speed(mpctx);
++        }
+     }
+ }
+ 
+@@ -1249,6 +1258,21 @@ void write_video(struct MPContext *mpctx)
      mpctx->last_frame_duration =
          mpctx->next_frames[0]->pkt_duration / mpctx->video_speed;
  
